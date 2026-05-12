@@ -30,6 +30,77 @@ logging.basicConfig(
 log = logging.getLogger("translator")
 
 
+class Theme:
+    THEMES = {
+        "light": {
+            "bg": "#f0f0f0",
+            "toolbar_bg": "#ffffff",
+            "panel_bg": "#ffffff",
+            "panel_fg": "#333333",
+            "input_bg": "#fafafa",
+            "input_fg": "#333333",
+            "input_cursor": "#333333",
+            "output_bg": "#f5f5f5",
+            "output_fg": "#333333",
+            "btn_bg": "#4a90d9",
+            "btn_fg": "#ffffff",
+            "btn_hover": "#3a7bc8",
+            "btn_frame_bg": "#f0f0f0",
+            "border": "#e0e0e0",
+            "title_fg": "#222222",
+            "status_fg": "#999999",
+            "label_fg": "#888888",
+            "sep_color": "#e0e0e0",
+            "checkbutton_bg": "#ffffff",
+            "entry_bg": "#ffffff",
+            "entry_fg": "#333333",
+            "combobox_bg": "#ffffff",
+            "dialog_bg": "#ffffff",
+        },
+        "dark": {
+            "bg": "#1e1e2e",
+            "toolbar_bg": "#2d2d3f",
+            "panel_bg": "#282838",
+            "panel_fg": "#e0e0e0",
+            "input_bg": "#1a1a2a",
+            "input_fg": "#d4d4d4",
+            "input_cursor": "#d4d4d4",
+            "output_bg": "#1a1a2a",
+            "output_fg": "#d4d4d4",
+            "btn_bg": "#5b9bd5",
+            "btn_fg": "#ffffff",
+            "btn_hover": "#4a8bc5",
+            "btn_frame_bg": "#2d2d3f",
+            "border": "#3d3d4f",
+            "title_fg": "#e0e0e0",
+            "status_fg": "#888888",
+            "label_fg": "#aaaaaa",
+            "sep_color": "#3d3d4f",
+            "checkbutton_bg": "#2d2d3f",
+            "entry_bg": "#2a2a3a",
+            "entry_fg": "#d4d4d4",
+            "combobox_bg": "#2a2a3a",
+            "dialog_bg": "#2d2d3f",
+        },
+    }
+
+    def __init__(self, name="light"):
+        self.name = name
+        self._colors = dict(self.THEMES.get(name, self.THEMES["light"]))
+
+    def switch(self, name):
+        self.name = name
+        self._colors = dict(self.THEMES.get(name, self.THEMES["light"]))
+
+    def toggle(self):
+        self.switch("dark" if self.name == "light" else "light")
+
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        return self._colors.get(key, "#000000")
+
+
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 
 DEFAULT_CONFIG = {
@@ -38,6 +109,8 @@ DEFAULT_CONFIG = {
     "model": "big-pickle",
     "provider": "opencode-zen",
     "selection_translate": True,
+    "clipboard_translate": False,
+    "theme": "light",
 }
 
 
@@ -66,24 +139,29 @@ class LRUCache:
         self._cache = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, text):
-        key = text.lower().strip()
+    def get(self, text, target_lang=None):
+        key = (text.lower().strip(), target_lang) if target_lang else text.lower().strip()
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key]
         return None
 
-    def set(self, text, translation):
+    def set(self, text, translation, target_lang=None):
         if len(text.strip()) > self.MAX_TEXT_LEN:
             return
-        key = text.lower().strip()
+        key = (text.lower().strip(), target_lang) if target_lang else text.lower().strip()
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
             self._cache[key] = translation
             while len(self._cache) > self.MAX_SIZE:
                 self._cache.popitem(last=False)
+
+    def delete(self, text, target_lang=None):
+        key = (text.lower().strip(), target_lang) if target_lang else text.lower().strip()
+        with self._lock:
+            self._cache.pop(key, None)
 
 
 # ── Timing constants (ms) ──────────────────────────────────────────
@@ -102,6 +180,95 @@ CLIPBOARD_RESTORE_DELAY_MS = 100    # delay before restoring original clipboard
 BTN_CLICK_TRANSLATE_DELAY  = 50     # delay between button click and translate start
 
 
+class LanguageDetector:
+    LANGUAGES = {
+        "zh": "中文", "en": "English", "ja": "日本語", "ko": "한국어",
+        "fr": "Français", "de": "Deutsch", "es": "Español", "ru": "Русский",
+    }
+    LANGUAGE_NAMES = {v: k for k, v in LANGUAGES.items()}
+    LANGUAGE_OPTIONS = ["自动检测"] + list(LANGUAGES.values())
+    TARGET_OPTIONS = list(LANGUAGES.values())
+
+    # Unicode ranges
+    _CJK = set(range(0x4E00, 0x9FFF + 1)) | set(range(0x3400, 0x4DBF + 1))
+    _HIRAGANA = set(range(0x3040, 0x309F + 1))
+    _KATAKANA = set(range(0x30A0, 0x30FF + 1))
+    _HANGUL = set(range(0xAC00, 0xD7AF + 1)) | set(range(0x1100, 0x11FF + 1))
+    _CYRILLIC = set(range(0x0400, 0x04FF + 1))
+    _LATIN_EXTENDED = set(range(0x00C0, 0x024F + 1))
+
+    # Accent character sets for disambiguation
+    _FR_ACCENTS = set("àâæçéèêëîïôùûüÿœÀÂÆÇÉÈÊËÎÏÔÙÛÜŸŒ")
+    _DE_ACCENTS = set("äöüßÄÖÜ")
+    _ES_ACCENTS = set("ñ¿¡Ñ")
+
+    @staticmethod
+    def detect(text):
+        """Detect language from text. Returns lang code or None if uncertain."""
+        if not text or not text.strip():
+            return None
+        sample = text[:200]
+        cjk = hira = kata = hangul = cyrillic = latin_ext = 0
+        fr_score = de_score = es_score = 0
+        for ch in sample:
+            cp = ord(ch)
+            if cp in LanguageDetector._CJK:
+                cjk += 1
+            elif cp in LanguageDetector._HIRAGANA:
+                hira += 1
+            elif cp in LanguageDetector._KATAKANA:
+                kata += 1
+            elif cp in LanguageDetector._HANGUL:
+                hangul += 1
+            elif cp in LanguageDetector._CYRILLIC:
+                cyrillic += 1
+            elif cp in LanguageDetector._LATIN_EXTENDED:
+                latin_ext += 1
+                if ch in LanguageDetector._FR_ACCENTS:
+                    fr_score += 1
+                if ch in LanguageDetector._DE_ACCENTS:
+                    de_score += 1
+                if ch in LanguageDetector._ES_ACCENTS:
+                    es_score += 1
+        if hira > 0 or kata > 0:
+            return "ja"
+        if hangul > 0:
+            return "ko"
+        if cyrillic > 0 and cyrillic >= cjk:
+            return "ru"
+        if cjk > 0:
+            return "zh"
+        if latin_ext > 0:
+            scores = {"fr": fr_score, "de": de_score, "es": es_score}
+            non_zero = {k: v for k, v in scores.items() if v > 0}
+            if len(non_zero) == 1:
+                return next(iter(non_zero))
+            return None
+        return "en"
+
+    @staticmethod
+    def get_prompt(source_lang=None, target_lang=None):
+        """Build translation system prompt. Returns v1 default prompt if both None."""
+        default_prompt = (
+            "You are a professional English to Chinese translator. "
+            "Translate the following English text to Chinese. "
+            "Only output the translation result, nothing else."
+        )
+        if source_lang is None and target_lang is None:
+            return default_prompt
+        target_name = LanguageDetector.LANGUAGES.get(target_lang or "zh", "Chinese")
+        if source_lang is None or source_lang == "auto":
+            return (
+                f"Auto-detect the source language and translate to {target_name}. "
+                "Only output the translation result, nothing else."
+            )
+        source_name = LanguageDetector.LANGUAGES.get(source_lang, source_lang)
+        return (
+            f"You are a professional translator. Translate from {source_name} to {target_name}. "
+            "Only output the translation result, nothing else."
+        )
+
+
 class Translator:
     MIN_INTERVAL = 1.0
 
@@ -117,12 +284,12 @@ class Translator:
     def update_config(self, config):
         self.config = config
 
-    def translate(self, text, callback):
+    def translate(self, text, callback, source_lang=None, target_lang=None):
         text = text.strip()
         if not text:
             callback("", None)
             return
-        cached = self.cache.get(text)
+        cached = self.cache.get(text, target_lang)
         if cached:
             callback(cached, None)
             return
@@ -139,20 +306,17 @@ class Translator:
             self._pending[text] = callback
 
         def worker():
-            # Snapshot config once to avoid torn reads during API call
             cfg = dict(self.config)
-            # Rate-limit: sleep inside the lock so that only one thread
-            # computes and updates _last_request_time at a time.
             with self._lock:
                 elapsed = time.time() - self._last_request_time
                 if elapsed < self.MIN_INTERVAL:
                     time.sleep(self.MIN_INTERVAL - elapsed)
                 self._last_request_time = time.time()
             log.info(f"API CALL: text={repr(text[:80])}")
-            result, error = self._call_api_with_config(text, cfg)
+            result, error = self._call_api_with_config(text, cfg, source_lang, target_lang)
             log.info(f"API RESPONSE: result={repr(result[:80] if result else None)}, error={error}")
             if result and not error:
-                self.cache.set(text, result)
+                self.cache.set(text, result, target_lang)
             with self._lock:
                 cb = self._pending.pop(text, None)
             if cb:
@@ -165,13 +329,6 @@ class Translator:
                     log.error(f"CALLBACK ERROR: {e}")
 
         self._executor.submit(worker)
-
-    def _call_api(self, text):
-        provider = self.config.get("provider", "mymemory")
-        if provider == "mymemory":
-            return self._call_mymemory(text)
-        else:
-            return self._call_openai_compatible(text)
 
     @staticmethod
     def _handle_api_error(e, context=""):
@@ -194,50 +351,16 @@ class Translator:
         else:
             return f"{prefix}翻译失败: {e}"
 
-    def _call_api_with_config(self, text, cfg):
+    def _call_api_with_config(self, text, cfg, source_lang=None, target_lang=None):
         """Call API using a config snapshot (for thread-safety)."""
         provider = cfg.get("provider", "mymemory")
         if provider == "mymemory":
-            return self._call_mymemory(text)
+            return self._call_mymemory(text, source_lang, target_lang)
         else:
-            return self._call_openai_compatible_with_config(text, cfg)
+            return self._call_openai_compatible_with_config(text, cfg, source_lang, target_lang)
 
-    def _call_openai_compatible(self, text):
-        api_base = self.config.get("api_base", "").rstrip("/")
-        api_key = self.config.get("api_key", "")
-        model = self.config.get("model", "big-pickle")
-        if not api_base:
-            return None, "未配置 API 地址，请在设置中配置"
-        if not api_key:
-            return None, "未配置 API Key，请在设置中配置"
-        url = f"{api_base}/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a professional English to Chinese translator. Translate the following English text to Chinese. Only output the translation result, nothing else.",
-                },
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2048,
-        }
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", f"Bearer {api_key}")
-        req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result = data["choices"][0]["message"]["content"].strip()
-                return result, None
-        except (urllib.error.HTTPError, urllib.error.URLError, KeyError, Exception) as e:
-            return None, self._handle_api_error(e)
-
-    def _call_openai_compatible_with_config(self, text, cfg):
-        """Like _call_openai_compatible but uses a config snapshot."""
+    def _call_openai_compatible_with_config(self, text, cfg, source_lang=None, target_lang=None):
+        """OpenAI-compatible API call using a config snapshot."""
         api_base = cfg.get("api_base", "").rstrip("/")
         api_key = cfg.get("api_key", "")
         model = cfg.get("model", "big-pickle")
@@ -251,7 +374,7 @@ class Translator:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a professional English to Chinese translator. Translate the following English text to Chinese. Only output the translation result, nothing else.",
+                    "content": LanguageDetector.get_prompt(source_lang, target_lang),
                 },
                 {"role": "user", "content": text},
             ],
@@ -271,12 +394,17 @@ class Translator:
         except (urllib.error.HTTPError, urllib.error.URLError, KeyError, Exception) as e:
             return None, self._handle_api_error(e)
 
-    def _call_mymemory(self, text):
+    def _call_mymemory(self, text, source_lang=None, target_lang=None):
         try:
+            src = source_lang if source_lang and source_lang != "auto" else "en"
+            tgt = target_lang or "zh"
+            lang_map = {"zh": "zh-CN"}
+            src_pair = lang_map.get(src, src)
+            tgt_pair = lang_map.get(tgt, tgt)
             url = "https://api.mymemory.translated.net/get"
             params = {
                 "q": text,
-                "langpair": "en|zh-CN",
+                "langpair": f"{src_pair}|{tgt_pair}",
                 "de": "hovertranslator@local.dev",
             }
             full_url = url + "?" + urllib.parse.urlencode(params)
@@ -664,6 +792,133 @@ class SelectionMonitor:
             )
 
 
+class ClipboardMonitor:
+    """Monitors clipboard changes via Win32 AddClipboardFormatListener."""
+    WM_CLIPBOARDUPDATE = 0x031D
+    WM_DESTROY = 0x0002
+    DEBOUNCE_MS = 300
+    MIN_TEXT_LEN = 2
+
+    def __init__(self, root, on_clipboard_text):
+        self.root = root
+        self.on_clipboard_text = on_clipboard_text  # callback(text, x, y)
+        self._enabled = False
+        self._last_text = ""
+        self._debounce_job = None
+        self._queue = queue.Queue()
+        self._hwnd = None
+        self._thread = None
+        self._wndproc = None
+        self._running = False
+
+    def set_enabled(self, enabled):
+        self._enabled = enabled
+        if not enabled:
+            self._last_text = ""
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._message_loop, daemon=True)
+        self._thread.start()
+        self.root.after(200, self._poll_queue)
+
+    def stop(self):
+        self._running = False
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, self.WM_DESTROY, 0, 0)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _message_loop(self):
+        WNDPROC = ctypes.CFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_void_p, ctypes.c_void_p
+        )
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            if msg == self.WM_CLIPBOARDUPDATE and self._enabled:
+                self._queue.put("clip")
+            elif msg == self.WM_DESTROY:
+                ctypes.windll.user32.PostQuitMessage(0)
+            return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wndproc = WNDPROC(wndproc)
+
+        wnd_class = ctypes.create_unicode_buffer("ClipboardMonitorClass")
+        h_instance = ctypes.windll.kernel32.GetModuleHandleW(None)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", ctypes.c_uint),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", ctypes.c_void_p),
+                ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p),
+            ]
+
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._wndproc
+        wc.hInstance = h_instance
+        wc.lpszClassName = wnd_class.value
+        ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
+
+        self._hwnd = ctypes.windll.user32.CreateWindowExW(
+            0, wnd_class, "ClipboardMonitor", 0,
+            0, 0, 0, 0, -3, 0, h_instance, 0  # HWND_MESSAGE = -3
+        )
+
+        ctypes.windll.user32.AddClipboardFormatListener(self._hwnd)
+
+        msg = ctypes.wintypes.MSG()
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+
+        ctypes.windll.user32.RemoveClipboardFormatListener(self._hwnd)
+        ctypes.windll.user32.DestroyWindow(self._hwnd)
+        ctypes.windll.user32.UnregisterClassW(wnd_class, h_instance)
+
+    def _poll_queue(self):
+        if not self._running:
+            return
+        try:
+            while True:
+                self._queue.get_nowait()
+                self._on_clipboard_event()
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_queue)
+
+    def _on_clipboard_event(self):
+        if not self._enabled:
+            return
+        if self._debounce_job:
+            self.root.after_cancel(self._debounce_job)
+        self._debounce_job = self.root.after(self.DEBOUNCE_MS, self._read_clipboard)
+
+    def _read_clipboard(self):
+        self._debounce_job = None
+        if not self._enabled:
+            return
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            return
+        if not text or len(text) < self.MIN_TEXT_LEN:
+            return
+        if text == self._last_text:
+            return
+        self._last_text = text
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        self.on_clipboard_text(text, pt.x, pt.y)
+
+
 class SettingsDialog:
     PROVIDERS = {
         "opencode-zen": {
@@ -810,6 +1065,15 @@ class SettingsDialog:
         )
         sel_check.pack(anchor="w", pady=4)
 
+        self.clip_var = tk.BooleanVar(value=self.config.get("clipboard_translate", False))
+        clip_check = tk.Checkbutton(
+            main,
+            text=" 启用剪贴板监听翻译（复制文字后弹出翻译按钮）",
+            variable=self.clip_var,
+            font=("Microsoft YaHei UI", 10),
+        )
+        clip_check.pack(anchor="w", pady=4)
+
         btn_frame = tk.Frame(main)
         btn_frame.pack(fill="x", pady=(15, 0))
         tk.Button(
@@ -867,6 +1131,7 @@ class SettingsDialog:
             "api_key": self.key_var.get().strip(),
             "model": self.model_var.get().strip(),
             "selection_translate": self.sel_var.get(),
+            "clipboard_translate": self.clip_var.get(),
         }
         save_config(cfg)
         self.on_save(cfg)
@@ -878,7 +1143,7 @@ class HoverTranslatorApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("悬停翻译器 — 英文→中文")
+        self.root.title("悬停翻译器")
         self.root.geometry("960x600")
         self.root.minsize(600, 400)
 
@@ -896,135 +1161,183 @@ class HoverTranslatorApp:
         self._btn_clicked = False
         self._clipboard_restore_job = None
         self._selection_seq = 0
+        self._source_lang = None
+        self._target_lang = "zh"
+        self._clipboard_monitor = None
+        self.theme = Theme(self.config.get("theme", "light"))
 
         self._build_ui()
         self._start_selection_monitor()
+        self._start_clipboard_monitor()
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _build_ui(self):
-        toolbar = tk.Frame(self.root, padx=8, pady=6)
-        toolbar.pack(fill="x")
+        t = self.theme
+        self.root.configure(bg=t.bg)
 
-        tk.Label(
-            toolbar, text="📖 悬停翻译器", font=("Microsoft YaHei UI", 13, "bold")
-        ).pack(side="left")
+        # ── Toolbar ──
+        self.toolbar = tk.Frame(self.root, bg=t.toolbar_bg, padx=10, pady=6)
+        self.toolbar.pack(fill="x")
+
+        self.title_label = tk.Label(
+            self.toolbar, text="📖 悬停翻译器",
+            font=("Microsoft YaHei UI", 13, "bold"),
+            bg=t.toolbar_bg, fg=t.title_fg,
+        )
+        self.title_label.pack(side="left")
 
         provider_name = SettingsDialog.PROVIDERS.get(
             self.config.get("provider", "mymemory"), {}
         ).get("name", "MyMemory")
         self.provider_label = tk.Label(
-            toolbar,
-            text=f"引擎: {provider_name}",
+            self.toolbar, text=f"引擎: {provider_name}",
             font=("Microsoft YaHei UI", 9),
-            fg="#888888",
+            bg=t.toolbar_bg, fg=t.label_fg,
         )
         self.provider_label.pack(side="left", padx=10)
 
-        btn_frame = tk.Frame(toolbar)
+        # ── Language dropdowns ──
+        self.lang_frame = tk.Frame(self.toolbar, bg=t.toolbar_bg)
+        self.lang_frame.pack(side="left", padx=6)
+
+        self.src_lang_label = tk.Label(
+            self.lang_frame, text="源:", font=("Microsoft YaHei UI", 9),
+            bg=t.toolbar_bg, fg=t.title_fg,
+        )
+        self.src_lang_label.pack(side="left")
+        self._source_combo = ttk.Combobox(
+            self.lang_frame, values=LanguageDetector.LANGUAGE_OPTIONS,
+            width=8, state="readonly", font=("Microsoft YaHei UI", 9),
+        )
+        self._source_combo.set("自动检测")
+        self._source_combo.pack(side="left", padx=(0, 6))
+        self._source_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
+        self.arrow_label = tk.Label(
+            self.lang_frame, text="→", font=("Microsoft YaHei UI", 9),
+            bg=t.toolbar_bg, fg=t.title_fg,
+        )
+        self.arrow_label.pack(side="left")
+        self._target_combo = ttk.Combobox(
+            self.lang_frame, values=LanguageDetector.TARGET_OPTIONS,
+            width=8, state="readonly", font=("Microsoft YaHei UI", 9),
+        )
+        self._target_combo.set("中文")
+        self._target_combo.pack(side="left", padx=(0, 4))
+        self._target_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
+        # ── Right-side buttons ──
+        btn_frame = tk.Frame(self.toolbar, bg=t.toolbar_bg)
         btn_frame.pack(side="right")
 
+        self.theme_btn = tk.Button(
+            btn_frame, text="🌙" if t.name == "light" else "☀️",
+            command=self._toggle_theme, font=("Microsoft YaHei UI", 10),
+            relief="flat", padx=6, cursor="hand2",
+            bg=t.toolbar_bg, fg=t.title_fg,
+        )
+        self.theme_btn.pack(side="left", padx=2)
+
         self.settings_btn = tk.Button(
-            btn_frame,
-            text="⚙️ 设置",
+            btn_frame, text="⚙️ 设置",
             command=self._open_settings,
-            font=("Microsoft YaHei UI", 9),
-            relief="groove",
-            padx=8,
+            font=("Microsoft YaHei UI", 9), relief="flat", padx=8,
+            bg=t.toolbar_bg, fg=t.title_fg, cursor="hand2",
         )
         self.settings_btn.pack(side="left", padx=2)
 
         self.translate_btn = tk.Button(
-            btn_frame,
-            text="🔄 翻译",
+            btn_frame, text="🔄 翻译",
             command=self._manual_translate,
-            font=("Microsoft YaHei UI", 9),
-            relief="groove",
-            padx=8,
-            bg="#4a90d9",
-            fg="white",
+            font=("Microsoft YaHei UI", 9), relief="flat", padx=8,
+            bg=t.btn_bg, fg=t.btn_fg, cursor="hand2",
         )
         self.translate_btn.pack(side="left", padx=2)
 
+        self.retranslate_btn = tk.Button(
+            btn_frame, text="🔁",
+            command=self._retranslate,
+            font=("Microsoft YaHei UI", 9), relief="flat", padx=4,
+            bg=t.toolbar_bg, fg=t.title_fg, cursor="hand2",
+        )
+        self.retranslate_btn.pack(side="left", padx=2)
+
         self.paste_btn = tk.Button(
-            btn_frame,
-            text="📋 粘贴并翻译",
+            btn_frame, text="📋 粘贴并翻译",
             command=self._paste_text,
-            font=("Microsoft YaHei UI", 9),
-            relief="groove",
-            padx=8,
+            font=("Microsoft YaHei UI", 9), relief="flat", padx=8,
+            bg=t.toolbar_bg, fg=t.title_fg, cursor="hand2",
         )
         self.paste_btn.pack(side="left", padx=2)
 
         self.clear_btn = tk.Button(
-            btn_frame,
-            text="🗑️ 清空",
+            btn_frame, text="🗑️ 清空",
             command=self._clear_text,
-            font=("Microsoft YaHei UI", 9),
-            relief="groove",
-            padx=8,
+            font=("Microsoft YaHei UI", 9), relief="flat", padx=8,
+            bg=t.toolbar_bg, fg=t.title_fg, cursor="hand2",
         )
         self.clear_btn.pack(side="left", padx=2)
 
-        sep = ttk.Separator(self.root, orient="horizontal")
-        sep.pack(fill="x")
+        # ── Separator ──
+        self.sep_frame = tk.Frame(self.root, height=1, bg=t.sep_color)
+        self.sep_frame.pack(fill="x")
 
-        panels = tk.PanedWindow(self.root, orient="horizontal", sashwidth=4)
-        panels.pack(fill="both", expand=True, padx=6, pady=6)
-
-        left_frame = tk.LabelFrame(
-            panels, text=" 📝 英文原文 ", font=("Microsoft YaHei UI", 10), padx=4, pady=4
+        # ── Panels ──
+        self.panels = tk.PanedWindow(
+            self.root, orient="horizontal", sashwidth=4,
+            bg=t.bg, sashrelief="flat",
         )
-        panels.add(left_frame, stretch="always")
+        self.panels.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+
+        self.left_frame = tk.LabelFrame(
+            self.panels, text=" 📝 源文本 (自动检测) ",
+            font=("Microsoft YaHei UI", 10),
+            bg=t.panel_bg, fg=t.panel_fg,
+            padx=4, pady=4, relief="groove", bd=1,
+        )
+        self.panels.add(self.left_frame, stretch="always")
 
         self.src_text = tk.Text(
-            left_frame,
-            font=("Consolas", 12),
-            wrap="word",
-            spacing3=3,
-            padx=8,
-            pady=8,
-            insertbackground="#333333",
-            relief="flat",
-            background="#fafafa",
+            self.left_frame,
+            font=("Consolas", 12), wrap="word", spacing3=3,
+            padx=8, pady=8, relief="flat",
+            bg=t.input_bg, fg=t.input_fg,
+            insertbackground=t.input_cursor,
         )
-        src_scroll = ttk.Scrollbar(left_frame, command=self.src_text.yview)
+        src_scroll = ttk.Scrollbar(self.left_frame, command=self.src_text.yview)
         self.src_text.configure(yscrollcommand=src_scroll.set)
         src_scroll.pack(side="right", fill="y")
         self.src_text.pack(side="left", fill="both", expand=True)
 
-        right_frame = tk.LabelFrame(
-            panels, text=" 🌏 中文翻译 ", font=("Microsoft YaHei UI", 10), padx=4, pady=4
+        self.right_frame = tk.LabelFrame(
+            self.panels, text=" 🌏 中文 ",
+            font=("Microsoft YaHei UI", 10),
+            bg=t.panel_bg, fg=t.panel_fg,
+            padx=4, pady=4, relief="groove", bd=1,
         )
-        panels.add(right_frame, stretch="always")
+        self.panels.add(self.right_frame, stretch="always")
 
         self.dst_text = tk.Text(
-            right_frame,
-            font=("Microsoft YaHei UI", 12),
-            wrap="word",
-            spacing3=3,
-            padx=8,
-            pady=8,
-            relief="flat",
-            background="#f5f5f5",
+            self.right_frame,
+            font=("Microsoft YaHei UI", 12), wrap="word", spacing3=3,
+            padx=8, pady=8, relief="flat",
+            bg=t.output_bg, fg=t.output_fg,
             state="disabled",
         )
-        dst_scroll = ttk.Scrollbar(right_frame, command=self.dst_text.yview)
+        dst_scroll = ttk.Scrollbar(self.right_frame, command=self.dst_text.yview)
         self.dst_text.configure(yscrollcommand=dst_scroll.set)
         dst_scroll.pack(side="right", fill="y")
         self.dst_text.pack(side="left", fill="both", expand=True)
 
+        # ── Status bar ──
         self.status_var = tk.StringVar(
-            value="就绪 — 在其他应用中拖选英文文字，点击「译」按钮翻译"
+            value="就绪 — 在其他应用中拖选文字，点击「译」按钮翻译"
         )
         self.status_bar = tk.Label(
-            self.root,
-            textvariable=self.status_var,
+            self.root, textvariable=self.status_var,
             font=("Microsoft YaHei UI", 9),
-            fg="#999999",
-            anchor="w",
-            padx=10,
-            pady=3,
-            relief="sunken",
+            bg=t.bg, fg=t.status_fg,
+            anchor="w", padx=10, pady=3, relief="flat",
         )
         self.status_bar.pack(fill="x")
 
@@ -1041,7 +1354,74 @@ class HoverTranslatorApp:
     def _on_paste_event(self, event=None):
         self.root.after(PASTE_TRANSLATE_DELAY_MS, self._do_translate)
 
+    def _on_language_change(self, event=None):
+        src_display = self._source_combo.get()
+        tgt_display = self._target_combo.get()
+        self._source_lang = LanguageDetector.LANGUAGE_NAMES.get(src_display)
+        if src_display == "自动检测":
+            self._source_lang = None
+        self._target_lang = LanguageDetector.LANGUAGE_NAMES.get(tgt_display, "zh")
+        self.left_frame.configure(text=f" 📝 源文本 ({src_display}) ")
+        self.right_frame.configure(text=f" 🌏 {tgt_display} ")
+        self._last_text = ""
+        self._do_translate()
+
+    def _toggle_theme(self):
+        self.theme.toggle()
+        self.config["theme"] = self.theme.name
+        save_config(self.config)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        t = self.theme
+        self.root.configure(bg=t.bg)
+
+        # Toolbar
+        self._theme_widget(self.toolbar, t.toolbar_bg)
+        self._theme_widget(self.title_label, t.toolbar_bg, t.title_fg)
+        self._theme_widget(self.provider_label, t.toolbar_bg, t.label_fg)
+        self._theme_widget(self.lang_frame, t.toolbar_bg)
+        self._theme_widget(self.src_lang_label, t.toolbar_bg, t.title_fg)
+        self._theme_widget(self.arrow_label, t.toolbar_bg, t.title_fg)
+
+        # Buttons
+        self.theme_btn.configure(
+            text="🌙" if t.name == "light" else "☀️",
+            bg=t.toolbar_bg, fg=t.title_fg,
+        )
+        self.settings_btn.configure(bg=t.toolbar_bg, fg=t.title_fg)
+        self.translate_btn.configure(bg=t.btn_bg, fg=t.btn_fg)
+        self.retranslate_btn.configure(bg=t.toolbar_bg, fg=t.title_fg)
+        self.paste_btn.configure(bg=t.toolbar_bg, fg=t.title_fg)
+        self.clear_btn.configure(bg=t.toolbar_bg, fg=t.title_fg)
+
+        # Separator
+        self.sep_frame.configure(bg=t.sep_color)
+
+        # Panels
+        self.panels.configure(bg=t.bg)
+        self.left_frame.configure(bg=t.panel_bg, fg=t.panel_fg)
+        self.right_frame.configure(bg=t.panel_bg, fg=t.panel_fg)
+        self.src_text.configure(bg=t.input_bg, fg=t.input_fg, insertbackground=t.input_cursor)
+        self.dst_text.configure(bg=t.output_bg, fg=t.output_fg)
+
+        # Status bar
+        self.status_bar.configure(bg=t.bg, fg=t.status_fg)
+
+    def _theme_widget(self, widget, bg, fg=None):
+        widget.configure(bg=bg)
+        if fg is not None:
+            widget.configure(fg=fg)
+
     def _manual_translate(self):
+        self._do_translate()
+
+    def _retranslate(self):
+        text = self.src_text.get("1.0", "end").strip()
+        if not text:
+            return
+        self.translator.cache.delete(text, self._target_lang)
+        self._last_text = ""
         self._do_translate()
 
     def _do_translate(self):
@@ -1070,7 +1450,7 @@ class HoverTranslatorApp:
                 self._set_dst_text("")
                 self._set_status("❌ 未获取到翻译结果", "#cc3333")
 
-        self.translator.translate(text, on_result)
+        self.translator.translate(text, on_result, source_lang=self._source_lang, target_lang=self._target_lang)
 
     def _set_dst_text(self, text):
         self.dst_text.configure(state="normal")
@@ -1110,8 +1490,11 @@ class HoverTranslatorApp:
         ).get("name", "MyMemory")
         self.provider_label.config(text=f"引擎: {provider_name}")
         self.selection_monitor.set_enabled(cfg.get("selection_translate", True))
-        status = "已启用" if cfg.get("selection_translate", True) else "已关闭"
-        self._set_status(f"✅ 设置已保存 | 划词翻译{status}", "#339933")
+        if self._clipboard_monitor:
+            self._clipboard_monitor.set_enabled(cfg.get("clipboard_translate", False))
+        sel_status = "已启用" if cfg.get("selection_translate", True) else "已关闭"
+        clip_status = "已启用" if cfg.get("clipboard_translate", False) else "已关闭"
+        self._set_status(f"✅ 设置已保存 | 划词翻译{sel_status} | 剪贴板翻译{clip_status}", "#339933")
 
     def _start_selection_monitor(self):
         self.selection_monitor = SelectionMonitor(
@@ -1121,9 +1504,28 @@ class HoverTranslatorApp:
         self.selection_monitor.set_enabled(enabled)
         self.selection_monitor.start()
 
+    def _start_clipboard_monitor(self):
+        self._clipboard_monitor = ClipboardMonitor(
+            self.root, self._on_clipboard_text
+        )
+        enabled = self.config.get("clipboard_translate", False)
+        self._clipboard_monitor.set_enabled(enabled)
+        self._clipboard_monitor.start()
+
+    def _on_clipboard_text(self, text, x, y):
+        if self._clipboard_backup is not None:
+            return
+        if len(text.strip()) < ClipboardMonitor.MIN_TEXT_LEN:
+            return
+        self._captured_text = text.strip()
+        self._selection_pos = (x, y)
+        self.floating_btn.show(x, y)
+
     def _on_closing(self):
         if hasattr(self, 'selection_monitor'):
             self.selection_monitor.stop()
+        if self._clipboard_monitor:
+            self._clipboard_monitor.stop()
         self.root.destroy()
 
     def _on_selection_cancel(self):
